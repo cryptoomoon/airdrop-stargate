@@ -1,0 +1,810 @@
+# -*- coding: utf-8 -*-
+import json
+import random
+from web3 import Web3
+import time
+from web3.exceptions import TransactionNotFound
+import eth_utils
+import asyncio
+import logging
+
+
+class StargateType:
+    TYPE_ARB_TO_OP = 1
+    TYPE_OP_TO_ARB = 2
+    TYPE_REMOVE_POOL = 3
+    TYPE_ARB_TO_APT = 4
+    TYPE_OP_TO_APT = 5
+    TYPE_ARB_POOL_DEPOSIT = 6
+    TYPE_SUSHI_ARB_TO_OP = 7
+
+
+class ChainInfo:
+    arb = {
+        "rpc": "https://arb1.arbitrum.io/rpc",
+        "gas_price": 1,
+        "gas_limit": 2000000,
+        "gas_limit_for_platform": 21000
+    }
+    op = {
+        "rpc": "https://rpc.ankr.com/optimism",
+        "gas_price": 1,
+        "gas_limit": 450000,
+        "gas_limit_for_platform": 21000
+    }
+
+
+class ERC20Token:
+    EIP20_ABI = json.loads(
+        '[{"constant":true,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":false,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":true,"inputs":[],"name":"totalSupply","outputs":[{"name":"","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":false,"inputs":[{"name":"_from","type":"address"},{"name":"_to","type":"address"},{"name":"_value","type":"uint256"}],"name":"transferFrom","outputs":[{"name":"","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":true,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":false,"inputs":[{"name":"_to","type":"address"},{"name":"_value","type":"uint256"}],"name":"transfer","outputs":[{"name":"","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":true,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"},{"anonymous":false,"inputs":[{"indexed":true,"name":"_from","type":"address"},{"indexed":true,"name":"_to","type":"address"},{"indexed":false,"name":"_value","type":"uint256"}],"name":"Transfer","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"name":"_owner","type":"address"},{"indexed":true,"name":"_spender","type":"address"},{"indexed":false,"name":"_value","type":"uint256"}],"name":"Approval","type":"event"}]')  # noqa: 501
+
+    def __init__(self, contract_address: str, web3: Web3):
+        self.contract_address = Web3.toChecksumAddress(contract_address)
+        self._web3 = web3
+        self.contract = self._web3.eth.contract(address=self.contract_address, abi=ERC20Token.EIP20_ABI)
+        self.token_balance = self.balanceOf(self.contract_address)
+        self.chain_id = self._web3.eth.chainId
+
+    def balanceOf(self, address: str):
+        return self.contract.caller().balanceOf(address)
+
+    def allowance(self, owner_address: str, spender_address: str):
+        return self.contract.caller().allowance(owner_address, spender_address)
+
+    # 调用者，调用者私钥，授权的地址，amount，gas价格（BSC上一般5-10），gas_limit（一般60000）
+    def approve(self, caller_address: str, caller_private_key: str, spender_address: str, amount, gas_price: float = 5,
+                gas_limit: int = 60000):
+        gas_price = getGasPrice(self._web3, 50)
+        txn = {
+            'chainId': self.chain_id,
+            # 'gas': gas_limit,
+            'gasPrice': eth_utils.to_wei(gas_price, "gwei"),
+            'nonce': self._web3.eth.getTransactionCount(caller_address),
+            'from': Web3.toChecksumAddress(caller_address)
+        }
+        transfer_txn = self.contract.functions.approve(Web3.toChecksumAddress(spender_address),
+                                                       int(amount)).buildTransaction(txn)
+
+        signed_tran = self._web3.eth.account.sign_transaction(transfer_txn, private_key=caller_private_key)
+        tran_hash = self._web3.eth.sendRawTransaction(signed_tran.rawTransaction)
+        return TransactionRet(tran_hash=tran_hash, web3=self._web3)
+
+    def transfer(self, from_address: str, private_key: str, to_address: str, amount, gas_price: float,
+                 gas_limit: int = 21000):
+        to_address = Web3.toChecksumAddress(to_address)
+        txn = {
+            'chainId': self.chain_id,
+            'gas': gas_limit,
+            'gasPrice': eth_utils.to_wei(gas_price, "gwei"),
+            'nonce': self._web3.eth.getTransactionCount(from_address),
+            'from': from_address
+        }
+        transfer_txn = self.contract.functions.transfer(to_address, int(amount)).buildTransaction(txn)
+
+        signed_tran = self._web3.eth.account.sign_transaction(transfer_txn, private_key=private_key)
+        tran_hash = self._web3.eth.sendRawTransaction(signed_tran.rawTransaction)
+        return TransactionRet(tran_hash=tran_hash, web3=self._web3)
+
+
+class TransactionRet:
+    def __init__(self, tran_hash: str, web3: Web3):
+        self._web3 = web3
+        self.tran_hash = tran_hash
+
+    def wait(self, timeout=60, interval=2) -> dict:
+        end_time = time.time() + 300
+        while time.time() < end_time:
+            try:
+                return self._web3.eth.getTransactionReceipt(self.tran_hash)
+            except TransactionNotFound:
+                time.sleep(interval)
+
+        raise TransactionNotFound("timeout and can not find the transaction")
+
+    async def waitAsync(self, timeout=60, interval=2) -> dict:
+        end_time = time.time() + 300
+        while time.time() < end_time:
+            try:
+                return self._web3.eth.getTransactionReceipt(self.tran_hash)
+            except TransactionNotFound:
+                await asyncio.sleep(interval)
+                # time.sleep(interval)
+
+        raise TransactionNotFound("timeout and can not find the transaction")
+
+
+def getGasPrice(web3: Web3, maxGasPrice: float):
+    '''
+    获取链上gas
+    :param web3:
+    :param maxGasPrice: 最大可接受的gas
+    :return:
+    '''
+    gas_price = web3.eth.gasPrice
+    while gas_price > int(maxGasPrice * pow(10, 9)):
+        print("当前gas:%s,超过限定值【%s】,10s后继续查询" % (int(gas_price / pow(10, 9)), maxGasPrice))
+        time.sleep(10)
+        gas_price = web3.eth.gasPrice
+
+    # result_gas = math.ceil(float(gas_price / pow(10, 9)))
+    result_gas = float(gas_price / pow(10, 9))
+    # print("使用gas: %s" % result_gas)
+    return result_gas
+
+
+def swap32(x):
+    return int.from_bytes(x.to_bytes(4, byteorder='little'), byteorder='big', signed=False)
+
+
+class StargateClient:
+    # abi
+    STARGATE_ABI = '[{"inputs":[{"internalType":"address","name":"_stargateEthVault","type":"address"},{"internalType":"address","name":"_stargateRouter","type":"address"},{"internalType":"uint16","name":"_poolId","type":"uint16"}],"stateMutability":"nonpayable","type":"constructor"},{"inputs":[],"name":"addLiquidityETH","outputs":[],"stateMutability":"payable","type":"function"},{"inputs":[],"name":"poolId","outputs":[{"internalType":"uint16","name":"","type":"uint16"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"stargateEthVault","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"stargateRouter","outputs":[{"internalType":"contract IStargateRouter","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint16","name":"_dstChainId","type":"uint16"},{"internalType":"address payable","name":"_refundAddress","type":"address"},{"internalType":"bytes","name":"_toAddress","type":"bytes"},{"internalType":"uint256","name":"_amountLD","type":"uint256"},{"internalType":"uint256","name":"_minAmountLD","type":"uint256"}],"name":"swapETH","outputs":[],"stateMutability":"payable","type":"function"},{"stateMutability":"payable","type":"receive"}]'
+    # 移除pool的合约
+    STARGATE_REMOVE_POOL_ABI = '[{"inputs":[],"stateMutability":"nonpayable","type":"constructor"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"uint16","name":"chainId","type":"uint16"},{"indexed":false,"internalType":"bytes","name":"srcAddress","type":"bytes"},{"indexed":false,"internalType":"uint256","name":"nonce","type":"uint256"},{"indexed":false,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"uint256","name":"amountLD","type":"uint256"},{"indexed":false,"internalType":"address","name":"to","type":"address"},{"indexed":false,"internalType":"bytes","name":"payload","type":"bytes"},{"indexed":false,"internalType":"bytes","name":"reason","type":"bytes"}],"name":"CachedSwapSaved","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"previousOwner","type":"address"},{"indexed":true,"internalType":"address","name":"newOwner","type":"address"}],"name":"OwnershipTransferred","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"uint16","name":"srcChainId","type":"uint16"},{"indexed":true,"internalType":"bytes","name":"srcAddress","type":"bytes"},{"indexed":true,"internalType":"uint256","name":"nonce","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"srcPoolId","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"dstPoolId","type":"uint256"},{"indexed":false,"internalType":"address","name":"to","type":"address"},{"indexed":false,"internalType":"uint256","name":"amountSD","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"mintAmountSD","type":"uint256"}],"name":"RedeemLocalCallback","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"uint8","name":"bridgeFunctionType","type":"uint8"},{"indexed":false,"internalType":"uint16","name":"chainId","type":"uint16"},{"indexed":false,"internalType":"bytes","name":"srcAddress","type":"bytes"},{"indexed":false,"internalType":"uint256","name":"nonce","type":"uint256"}],"name":"Revert","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"uint16","name":"srcChainId","type":"uint16"},{"indexed":false,"internalType":"uint256","name":"_srcPoolId","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"_dstPoolId","type":"uint256"},{"indexed":false,"internalType":"bytes","name":"to","type":"bytes"},{"indexed":false,"internalType":"uint256","name":"redeemAmountSD","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"mintAmountSD","type":"uint256"},{"indexed":true,"internalType":"uint256","name":"nonce","type":"uint256"},{"indexed":true,"internalType":"bytes","name":"srcAddress","type":"bytes"}],"name":"RevertRedeemLocal","type":"event"},{"inputs":[{"internalType":"uint256","name":"_poolId","type":"uint256"},{"internalType":"uint16","name":"_dstChainId","type":"uint16"},{"internalType":"uint256","name":"_dstPoolId","type":"uint256"}],"name":"activateChainPath","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"_poolId","type":"uint256"},{"internalType":"uint256","name":"_amountLD","type":"uint256"},{"internalType":"address","name":"_to","type":"address"}],"name":"addLiquidity","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"bridge","outputs":[{"internalType":"contract Bridge","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint16","name":"","type":"uint16"},{"internalType":"bytes","name":"","type":"bytes"},{"internalType":"uint256","name":"","type":"uint256"}],"name":"cachedSwapLookup","outputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amountLD","type":"uint256"},{"internalType":"address","name":"to","type":"address"},{"internalType":"bytes","name":"payload","type":"bytes"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"_poolId","type":"uint256"},{"internalType":"bool","name":"_fullMode","type":"bool"}],"name":"callDelta","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint16","name":"_srcChainId","type":"uint16"},{"internalType":"bytes","name":"_srcAddress","type":"bytes"},{"internalType":"uint256","name":"_nonce","type":"uint256"}],"name":"clearCachedSwap","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"_poolId","type":"uint256"},{"internalType":"uint16","name":"_dstChainId","type":"uint16"},{"internalType":"uint256","name":"_dstPoolId","type":"uint256"},{"internalType":"uint256","name":"_weight","type":"uint256"}],"name":"createChainPath","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"_poolId","type":"uint256"},{"internalType":"address","name":"_token","type":"address"},{"internalType":"uint8","name":"_sharedDecimals","type":"uint8"},{"internalType":"uint8","name":"_localDecimals","type":"uint8"},{"internalType":"string","name":"_name","type":"string"},{"internalType":"string","name":"_symbol","type":"string"}],"name":"createPool","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint16","name":"_dstChainId","type":"uint16"},{"internalType":"uint256","name":"_dstPoolId","type":"uint256"},{"internalType":"uint256","name":"_srcPoolId","type":"uint256"},{"components":[{"internalType":"uint256","name":"credits","type":"uint256"},{"internalType":"uint256","name":"idealBalance","type":"uint256"}],"internalType":"struct Pool.CreditObj","name":"_c","type":"tuple"}],"name":"creditChainPath","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"factory","outputs":[{"internalType":"contract Factory","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint16","name":"_srcPoolId","type":"uint16"},{"internalType":"uint256","name":"_amountLP","type":"uint256"},{"internalType":"address","name":"_to","type":"address"}],"name":"instantRedeemLocal","outputs":[{"internalType":"uint256","name":"amountSD","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"mintFeeOwner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"protocolFeeOwner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint16","name":"_dstChainId","type":"uint16"},{"internalType":"uint8","name":"_functionType","type":"uint8"},{"internalType":"bytes","name":"_toAddress","type":"bytes"},{"internalType":"bytes","name":"_transferAndCallPayload","type":"bytes"},{"components":[{"internalType":"uint256","name":"dstGasForCall","type":"uint256"},{"internalType":"uint256","name":"dstNativeAmount","type":"uint256"},{"internalType":"bytes","name":"dstNativeAddr","type":"bytes"}],"internalType":"struct IStargateRouter.lzTxObj","name":"_lzTxParams","type":"tuple"}],"name":"quoteLayerZeroFee","outputs":[{"internalType":"uint256","name":"","type":"uint256"},{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint16","name":"_dstChainId","type":"uint16"},{"internalType":"uint256","name":"_srcPoolId","type":"uint256"},{"internalType":"uint256","name":"_dstPoolId","type":"uint256"},{"internalType":"address payable","name":"_refundAddress","type":"address"},{"internalType":"uint256","name":"_amountLP","type":"uint256"},{"internalType":"bytes","name":"_to","type":"bytes"},{"components":[{"internalType":"uint256","name":"dstGasForCall","type":"uint256"},{"internalType":"uint256","name":"dstNativeAmount","type":"uint256"},{"internalType":"bytes","name":"dstNativeAddr","type":"bytes"}],"internalType":"struct IStargateRouter.lzTxObj","name":"_lzTxParams","type":"tuple"}],"name":"redeemLocal","outputs":[],"stateMutability":"payable","type":"function"},{"inputs":[{"internalType":"uint16","name":"_srcChainId","type":"uint16"},{"internalType":"bytes","name":"_srcAddress","type":"bytes"},{"internalType":"uint256","name":"_nonce","type":"uint256"},{"internalType":"uint256","name":"_srcPoolId","type":"uint256"},{"internalType":"uint256","name":"_dstPoolId","type":"uint256"},{"internalType":"address","name":"_to","type":"address"},{"internalType":"uint256","name":"_amountSD","type":"uint256"},{"internalType":"uint256","name":"_mintAmountSD","type":"uint256"}],"name":"redeemLocalCallback","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint16","name":"_srcChainId","type":"uint16"},{"internalType":"bytes","name":"_srcAddress","type":"bytes"},{"internalType":"uint256","name":"_nonce","type":"uint256"},{"internalType":"uint256","name":"_srcPoolId","type":"uint256"},{"internalType":"uint256","name":"_dstPoolId","type":"uint256"},{"internalType":"uint256","name":"_amountSD","type":"uint256"},{"internalType":"bytes","name":"_to","type":"bytes"}],"name":"redeemLocalCheckOnRemote","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint16","name":"_dstChainId","type":"uint16"},{"internalType":"uint256","name":"_srcPoolId","type":"uint256"},{"internalType":"uint256","name":"_dstPoolId","type":"uint256"},{"internalType":"address payable","name":"_refundAddress","type":"address"},{"internalType":"uint256","name":"_amountLP","type":"uint256"},{"internalType":"uint256","name":"_minAmountLD","type":"uint256"},{"internalType":"bytes","name":"_to","type":"bytes"},{"components":[{"internalType":"uint256","name":"dstGasForCall","type":"uint256"},{"internalType":"uint256","name":"dstNativeAmount","type":"uint256"},{"internalType":"bytes","name":"dstNativeAddr","type":"bytes"}],"internalType":"struct IStargateRouter.lzTxObj","name":"_lzTxParams","type":"tuple"}],"name":"redeemRemote","outputs":[],"stateMutability":"payable","type":"function"},{"inputs":[],"name":"renounceOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint16","name":"_srcChainId","type":"uint16"},{"internalType":"bytes","name":"_srcAddress","type":"bytes"},{"internalType":"uint256","name":"_nonce","type":"uint256"}],"name":"retryRevert","outputs":[],"stateMutability":"payable","type":"function"},{"inputs":[{"internalType":"uint16","name":"","type":"uint16"},{"internalType":"bytes","name":"","type":"bytes"},{"internalType":"uint256","name":"","type":"uint256"}],"name":"revertLookup","outputs":[{"internalType":"bytes","name":"","type":"bytes"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint16","name":"_dstChainId","type":"uint16"},{"internalType":"bytes","name":"_srcAddress","type":"bytes"},{"internalType":"uint256","name":"_nonce","type":"uint256"},{"internalType":"address payable","name":"_refundAddress","type":"address"},{"components":[{"internalType":"uint256","name":"dstGasForCall","type":"uint256"},{"internalType":"uint256","name":"dstNativeAmount","type":"uint256"},{"internalType":"bytes","name":"dstNativeAddr","type":"bytes"}],"internalType":"struct IStargateRouter.lzTxObj","name":"_lzTxParams","type":"tuple"}],"name":"revertRedeemLocal","outputs":[],"stateMutability":"payable","type":"function"},{"inputs":[{"internalType":"uint16","name":"_dstChainId","type":"uint16"},{"internalType":"uint256","name":"_srcPoolId","type":"uint256"},{"internalType":"uint256","name":"_dstPoolId","type":"uint256"},{"internalType":"address payable","name":"_refundAddress","type":"address"}],"name":"sendCredits","outputs":[],"stateMutability":"payable","type":"function"},{"inputs":[{"internalType":"contract Bridge","name":"_bridge","type":"address"},{"internalType":"contract Factory","name":"_factory","type":"address"}],"name":"setBridgeAndFactory","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"_poolId","type":"uint256"},{"internalType":"bool","name":"_batched","type":"bool"},{"internalType":"uint256","name":"_swapDeltaBP","type":"uint256"},{"internalType":"uint256","name":"_lpDeltaBP","type":"uint256"},{"internalType":"bool","name":"_defaultSwapMode","type":"bool"},{"internalType":"bool","name":"_defaultLPMode","type":"bool"}],"name":"setDeltaParam","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"_poolId","type":"uint256"},{"internalType":"address","name":"_feeLibraryAddr","type":"address"}],"name":"setFeeLibrary","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"_poolId","type":"uint256"},{"internalType":"uint256","name":"_mintFeeBP","type":"uint256"}],"name":"setFees","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"_owner","type":"address"}],"name":"setMintFeeOwner","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"_owner","type":"address"}],"name":"setProtocolFeeOwner","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"_poolId","type":"uint256"},{"internalType":"bool","name":"_swapStop","type":"bool"}],"name":"setSwapStop","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"_poolId","type":"uint256"},{"internalType":"uint16","name":"_dstChainId","type":"uint16"},{"internalType":"uint256","name":"_dstPoolId","type":"uint256"},{"internalType":"uint16","name":"_weight","type":"uint16"}],"name":"setWeightForChainPath","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint16","name":"_dstChainId","type":"uint16"},{"internalType":"uint256","name":"_srcPoolId","type":"uint256"},{"internalType":"uint256","name":"_dstPoolId","type":"uint256"},{"internalType":"address payable","name":"_refundAddress","type":"address"},{"internalType":"uint256","name":"_amountLD","type":"uint256"},{"internalType":"uint256","name":"_minAmountLD","type":"uint256"},{"components":[{"internalType":"uint256","name":"dstGasForCall","type":"uint256"},{"internalType":"uint256","name":"dstNativeAmount","type":"uint256"},{"internalType":"bytes","name":"dstNativeAddr","type":"bytes"}],"internalType":"struct IStargateRouter.lzTxObj","name":"_lzTxParams","type":"tuple"},{"internalType":"bytes","name":"_to","type":"bytes"},{"internalType":"bytes","name":"_payload","type":"bytes"}],"name":"swap","outputs":[],"stateMutability":"payable","type":"function"},{"inputs":[{"internalType":"uint16","name":"_srcChainId","type":"uint16"},{"internalType":"bytes","name":"_srcAddress","type":"bytes"},{"internalType":"uint256","name":"_nonce","type":"uint256"},{"internalType":"uint256","name":"_srcPoolId","type":"uint256"},{"internalType":"uint256","name":"_dstPoolId","type":"uint256"},{"internalType":"uint256","name":"_dstGasForCall","type":"uint256"},{"internalType":"address","name":"_to","type":"address"},{"components":[{"internalType":"uint256","name":"amount","type":"uint256"},{"internalType":"uint256","name":"eqFee","type":"uint256"},{"internalType":"uint256","name":"eqReward","type":"uint256"},{"internalType":"uint256","name":"lpFee","type":"uint256"},{"internalType":"uint256","name":"protocolFee","type":"uint256"},{"internalType":"uint256","name":"lkbRemove","type":"uint256"}],"internalType":"struct Pool.SwapObj","name":"_s","type":"tuple"},{"internalType":"bytes","name":"_payload","type":"bytes"}],"name":"swapRemote","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"newOwner","type":"address"}],"name":"transferOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"_poolId","type":"uint256"},{"internalType":"address","name":"_to","type":"address"}],"name":"withdrawMintFee","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"_poolId","type":"uint256"},{"internalType":"address","name":"_to","type":"address"}],"name":"withdrawProtocolFee","outputs":[],"stateMutability":"nonpayable","type":"function"}]'
+
+    # arb 跨到apt 的合约
+    ARB_TO_APT_ABI = '[{"inputs":[{"internalType":"address","name":"_layerZeroEndpoint","type":"address"},{"internalType":"uint16","name":"_aptosChainId","type":"uint16"}],"stateMutability":"nonpayable","type":"constructor"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"bool","name":"enabled","type":"bool"},{"indexed":false,"internalType":"uint256","name":"unlockTime","type":"uint256"}],"name":"EnableEmergencyWithdraw","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"uint16","name":"_srcChainId","type":"uint16"},{"indexed":false,"internalType":"bytes","name":"_srcAddress","type":"bytes"},{"indexed":false,"internalType":"uint64","name":"_nonce","type":"uint64"},{"indexed":false,"internalType":"bytes","name":"_payload","type":"bytes"},{"indexed":false,"internalType":"bytes","name":"_reason","type":"bytes"}],"name":"MessageFailed","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"previousOwner","type":"address"},{"indexed":true,"internalType":"address","name":"newOwner","type":"address"}],"name":"OwnershipTransferred","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"address","name":"to","type":"address"},{"indexed":false,"internalType":"uint256","name":"amountLD","type":"uint256"}],"name":"Receive","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"address","name":"token","type":"address"}],"name":"RegisterToken","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"uint16","name":"_srcChainId","type":"uint16"},{"indexed":false,"internalType":"bytes","name":"_srcAddress","type":"bytes"},{"indexed":false,"internalType":"uint64","name":"_nonce","type":"uint64"},{"indexed":false,"internalType":"bytes32","name":"_payloadHash","type":"bytes32"}],"name":"RetryMessageSuccess","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"address","name":"from","type":"address"},{"indexed":true,"internalType":"bytes32","name":"to","type":"bytes32"},{"indexed":false,"internalType":"uint256","name":"amountLD","type":"uint256"}],"name":"Send","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"uint16","name":"aptosChainId","type":"uint16"}],"name":"SetAptosChainId","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"uint256","name":"bridgeFeeBP","type":"uint256"}],"name":"SetBridgeBP","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"bool","name":"paused","type":"bool"}],"name":"SetGlobalPause","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"uint16","name":"localChainId","type":"uint16"}],"name":"SetLocalChainId","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"uint16","name":"_dstChainId","type":"uint16"},{"indexed":false,"internalType":"uint16","name":"_type","type":"uint16"},{"indexed":false,"internalType":"uint256","name":"_minDstGas","type":"uint256"}],"name":"SetMinDstGas","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"address","name":"precrime","type":"address"}],"name":"SetPrecrime","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"bool","name":"paused","type":"bool"}],"name":"SetTokenPause","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"uint16","name":"_remoteChainId","type":"uint16"},{"indexed":false,"internalType":"bytes","name":"_path","type":"bytes"}],"name":"SetTrustedRemote","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"uint16","name":"_remoteChainId","type":"uint16"},{"indexed":false,"internalType":"bytes","name":"_remoteAddress","type":"bytes"}],"name":"SetTrustedRemoteAddress","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"bool","name":"useCustomAdapterParams","type":"bool"}],"name":"SetUseCustomAdapterParams","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"address","name":"weth","type":"address"}],"name":"SetWETH","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"address","name":"to","type":"address"},{"indexed":false,"internalType":"uint256","name":"amountLD","type":"uint256"}],"name":"WithdrawFee","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"address","name":"to","type":"address"},{"indexed":false,"internalType":"uint256","name":"amountLD","type":"uint256"}],"name":"WithdrawTVL","type":"event"},{"inputs":[],"name":"BP_DENOMINATOR","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"SHARED_DECIMALS","outputs":[{"internalType":"uint8","name":"","type":"uint8"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"_token","type":"address"}],"name":"accruedFeeLD","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"aptosChainId","outputs":[{"internalType":"uint16","name":"","type":"uint16"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"bridgeFeeBP","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"emergencyWithdrawEnabled","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"emergencyWithdrawTime","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"bool","name":"enabled","type":"bool"}],"name":"enableEmergencyWithdraw","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint16","name":"","type":"uint16"},{"internalType":"bytes","name":"","type":"bytes"},{"internalType":"uint64","name":"","type":"uint64"}],"name":"failedMessages","outputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint16","name":"_srcChainId","type":"uint16"},{"internalType":"bytes","name":"_srcAddress","type":"bytes"}],"name":"forceResumeReceive","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint16","name":"_version","type":"uint16"},{"internalType":"uint16","name":"_chainId","type":"uint16"},{"internalType":"address","name":"","type":"address"},{"internalType":"uint256","name":"_configType","type":"uint256"}],"name":"getConfig","outputs":[{"internalType":"bytes","name":"","type":"bytes"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint16","name":"_remoteChainId","type":"uint16"}],"name":"getTrustedRemoteAddress","outputs":[{"internalType":"bytes","name":"","type":"bytes"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"globalPaused","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint16","name":"_srcChainId","type":"uint16"},{"internalType":"bytes","name":"_srcAddress","type":"bytes"}],"name":"isTrustedRemote","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"ld2sdRates","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"lzEndpoint","outputs":[{"internalType":"contract ILayerZeroEndpoint","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint16","name":"_srcChainId","type":"uint16"},{"internalType":"bytes","name":"_srcAddress","type":"bytes"},{"internalType":"uint64","name":"_nonce","type":"uint64"},{"internalType":"bytes","name":"_payload","type":"bytes"}],"name":"lzReceive","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint16","name":"","type":"uint16"},{"internalType":"uint16","name":"","type":"uint16"}],"name":"minDstGasLookup","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint16","name":"_srcChainId","type":"uint16"},{"internalType":"bytes","name":"_srcAddress","type":"bytes"},{"internalType":"uint64","name":"_nonce","type":"uint64"},{"internalType":"bytes","name":"_payload","type":"bytes"}],"name":"nonblockingLzReceive","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"pausedTokens","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"precrime","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"components":[{"internalType":"address payable","name":"refundAddress","type":"address"},{"internalType":"address","name":"zroPaymentAddress","type":"address"}],"internalType":"struct LzLib.CallParams","name":"_callParams","type":"tuple"},{"internalType":"bytes","name":"_adapterParams","type":"bytes"}],"name":"quoteForSend","outputs":[{"internalType":"uint256","name":"nativeFee","type":"uint256"},{"internalType":"uint256","name":"zroFee","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"_token","type":"address"}],"name":"registerToken","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"renounceOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint16","name":"_srcChainId","type":"uint16"},{"internalType":"bytes","name":"_srcAddress","type":"bytes"},{"internalType":"uint64","name":"_nonce","type":"uint64"},{"internalType":"bytes","name":"_payload","type":"bytes"}],"name":"retryMessage","outputs":[],"stateMutability":"payable","type":"function"},{"inputs":[{"internalType":"bytes32","name":"_toAddress","type":"bytes32"},{"internalType":"uint256","name":"_amountLD","type":"uint256"},{"components":[{"internalType":"address payable","name":"refundAddress","type":"address"},{"internalType":"address","name":"zroPaymentAddress","type":"address"}],"internalType":"struct LzLib.CallParams","name":"_callParams","type":"tuple"},{"internalType":"bytes","name":"_adapterParams","type":"bytes"}],"name":"sendETHToAptos","outputs":[],"stateMutability":"payable","type":"function"},{"inputs":[{"internalType":"address","name":"_token","type":"address"},{"internalType":"bytes32","name":"_toAddress","type":"bytes32"},{"internalType":"uint256","name":"_amountLD","type":"uint256"},{"components":[{"internalType":"address payable","name":"refundAddress","type":"address"},{"internalType":"address","name":"zroPaymentAddress","type":"address"}],"internalType":"struct LzLib.CallParams","name":"_callParams","type":"tuple"},{"internalType":"bytes","name":"_adapterParams","type":"bytes"}],"name":"sendToAptos","outputs":[],"stateMutability":"payable","type":"function"},{"inputs":[{"internalType":"uint16","name":"_aptosChainId","type":"uint16"}],"name":"setAptosChainId","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"_bridgeFeeBP","type":"uint256"}],"name":"setBridgeFeeBP","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint16","name":"_version","type":"uint16"},{"internalType":"uint16","name":"_chainId","type":"uint16"},{"internalType":"uint256","name":"_configType","type":"uint256"},{"internalType":"bytes","name":"_config","type":"bytes"}],"name":"setConfig","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"bool","name":"_paused","type":"bool"}],"name":"setGlobalPause","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint16","name":"_dstChainId","type":"uint16"},{"internalType":"uint16","name":"_packetType","type":"uint16"},{"internalType":"uint256","name":"_minGas","type":"uint256"}],"name":"setMinDstGas","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"_precrime","type":"address"}],"name":"setPrecrime","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint16","name":"_version","type":"uint16"}],"name":"setReceiveVersion","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint16","name":"_version","type":"uint16"}],"name":"setSendVersion","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"_token","type":"address"},{"internalType":"bool","name":"_paused","type":"bool"}],"name":"setTokenPause","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint16","name":"_srcChainId","type":"uint16"},{"internalType":"bytes","name":"_path","type":"bytes"}],"name":"setTrustedRemote","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint16","name":"_remoteChainId","type":"uint16"},{"internalType":"bytes","name":"_remoteAddress","type":"bytes"}],"name":"setTrustedRemoteAddress","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"bool","name":"_useCustomAdapterParams","type":"bool"}],"name":"setUseCustomAdapterParams","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"_weth","type":"address"}],"name":"setWETH","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"supportedTokens","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"newOwner","type":"address"}],"name":"transferOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint16","name":"","type":"uint16"}],"name":"trustedRemoteLookup","outputs":[{"internalType":"bytes","name":"","type":"bytes"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"tvlSDs","outputs":[{"internalType":"uint64","name":"","type":"uint64"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"useCustomAdapterParams","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"weth","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"_token","type":"address"},{"internalType":"address","name":"_to","type":"address"}],"name":"withdrawEmergency","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"_token","type":"address"},{"internalType":"address","name":"_to","type":"address"},{"internalType":"uint256","name":"_amountLD","type":"uint256"}],"name":"withdrawFee","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"_token","type":"address"},{"internalType":"address","name":"_to","type":"address"},{"internalType":"uint64","name":"_amountSD","type":"uint64"}],"name":"withdrawTVL","outputs":[],"stateMutability":"nonpayable","type":"function"},{"stateMutability":"payable","type":"receive"}]'
+
+    ARB_POOL_DEPOSIT_ABI = '[{"inputs":[{"internalType":"contract StargateToken","name":"_stargate","type":"address"},{"internalType":"uint256","name":"_stargatePerBlock","type":"uint256"},{"internalType":"uint256","name":"_startBlock","type":"uint256"},{"internalType":"uint256","name":"_bonusEndBlock","type":"uint256"}],"stateMutability":"nonpayable","type":"constructor"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"uint256","name":"pid","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"Deposit","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"uint256","name":"pid","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"EmergencyWithdraw","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"previousOwner","type":"address"},{"indexed":true,"internalType":"address","name":"newOwner","type":"address"}],"name":"OwnershipTransferred","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"uint256","name":"pid","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"Withdraw","type":"event"},{"inputs":[],"name":"BONUS_MULTIPLIER","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"_allocPoint","type":"uint256"},{"internalType":"contract IERC20","name":"_lpToken","type":"address"}],"name":"add","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"bonusEndBlock","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"_pid","type":"uint256"},{"internalType":"uint256","name":"_amount","type":"uint256"}],"name":"deposit","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"_pid","type":"uint256"}],"name":"emergencyWithdraw","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"_from","type":"uint256"},{"internalType":"uint256","name":"_to","type":"uint256"}],"name":"getMultiplier","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"","type":"uint256"}],"name":"lpBalances","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"massUpdatePools","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"_pid","type":"uint256"},{"internalType":"address","name":"_user","type":"address"}],"name":"pendingStargate","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"","type":"uint256"}],"name":"poolInfo","outputs":[{"internalType":"contract IERC20","name":"lpToken","type":"address"},{"internalType":"uint256","name":"allocPoint","type":"uint256"},{"internalType":"uint256","name":"lastRewardBlock","type":"uint256"},{"internalType":"uint256","name":"accStargatePerShare","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"poolLength","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"renounceOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"_pid","type":"uint256"},{"internalType":"uint256","name":"_allocPoint","type":"uint256"}],"name":"set","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"_stargatePerBlock","type":"uint256"}],"name":"setStargatePerBlock","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"stargate","outputs":[{"internalType":"contract StargateToken","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"stargatePerBlock","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"startBlock","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"totalAllocPoint","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"newOwner","type":"address"}],"name":"transferOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"_pid","type":"uint256"}],"name":"updatePool","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"","type":"uint256"},{"internalType":"address","name":"","type":"address"}],"name":"userInfo","outputs":[{"internalType":"uint256","name":"amount","type":"uint256"},{"internalType":"uint256","name":"rewardDebt","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"_pid","type":"uint256"},{"internalType":"uint256","name":"_amount","type":"uint256"}],"name":"withdraw","outputs":[],"stateMutability":"nonpayable","type":"function"}]'
+
+    SUSHISWAP_ABI = '[{"inputs":[{"internalType":"contract IBentoBoxMinimal","name":"_bentoBox","type":"address"},{"internalType":"contract IStargateRouter","name":"_stargateRouter","type":"address"},{"internalType":"address","name":"_factory","type":"address"},{"internalType":"bytes32","name":"_pairCodeHash","type":"bytes32"},{"internalType":"contract IStargateWidget","name":"_stargateWidget","type":"address"}],"stateMutability":"nonpayable","type":"constructor"},{"inputs":[],"name":"NotStargateRouter","type":"error"},{"inputs":[],"name":"TooLittleReceived","type":"error"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"bytes32","name":"srcContext","type":"bytes32"},{"indexed":false,"internalType":"bool","name":"failed","type":"bool"}],"name":"StargateSushiXSwapDst","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"bytes32","name":"srcContext","type":"bytes32"}],"name":"StargateSushiXSwapSrc","type":"event"},{"inputs":[{"internalType":"contract IERC20","name":"token","type":"address"}],"name":"approveToStargateRouter","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"bentoBox","outputs":[{"internalType":"contract IBentoBoxMinimal","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint8[]","name":"actions","type":"uint8[]"},{"internalType":"uint256[]","name":"values","type":"uint256[]"},{"internalType":"bytes[]","name":"datas","type":"bytes[]"}],"name":"cook","outputs":[],"stateMutability":"payable","type":"function"},{"inputs":[],"name":"factory","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint16","name":"_dstChainId","type":"uint16"},{"internalType":"uint8","name":"_functionType","type":"uint8"},{"internalType":"address","name":"_receiver","type":"address"},{"internalType":"uint256","name":"_gas","type":"uint256"},{"internalType":"uint256","name":"_dustAmount","type":"uint256"},{"internalType":"bytes","name":"_payload","type":"bytes"}],"name":"getFee","outputs":[{"internalType":"uint256","name":"a","type":"uint256"},{"internalType":"uint256","name":"b","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"pairCodeHash","outputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint16","name":"","type":"uint16"},{"internalType":"bytes","name":"","type":"bytes"},{"internalType":"uint256","name":"","type":"uint256"},{"internalType":"address","name":"_token","type":"address"},{"internalType":"uint256","name":"amountLD","type":"uint256"},{"internalType":"bytes","name":"payload","type":"bytes"}],"name":"sgReceive","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"stargateRouter","outputs":[{"internalType":"contract IStargateRouter","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"stargateWidget","outputs":[{"internalType":"contract IStargateWidget","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"stateMutability":"payable","type":"receive"}]'
+
+    # 跨链前先要求钱包不低于
+    # REQUIRE_AMOUNT = 0.006
+
+    CURRENCY = {
+        "ETH-ARB-TO-OP": {
+            "chainId": 111,
+            "decimals": 18
+        },
+        "ETH-OP-TO-ARB": {
+            "chainId": 110,
+            "decimals": 18
+        }
+    }
+
+    # arb 跨 op 的 合约 地址
+    STARGATE_ARB_TO_OP_CONTRACT_ADDRESS = Web3.toChecksumAddress("0xbf22f0f184bccbea268df387a49ff5238dd23e40")
+
+    # op 跨 arb 的 合约 地址
+    STARGATE_OP_TO_ARB_CONTRACT_ADDRESS = Web3.toChecksumAddress("0xb49c4e680174e331cb0a7ff3ab58afc9738d5f8b")
+
+    # stage 移除流动性的合约地址
+    STARGATE_REMOVE_POOL_CONTRACT_ADDRESS = Web3.toChecksumAddress('0x53bf833a5d6c4dda888f69c22c88c9f356a41614')
+
+    # ShushiSwap arb 到 op 合约地址
+    SUSHI_ARB_TO_OP_CONTRACT_ADDRESS = Web3.toChecksumAddress('0x53b08dbd70327b7ba3b7886fc9987bc985d27262')
+
+    # arb -> apt 的合约地址
+    ARB_TO_APT_CONTRACT_ADDRESS = Web3.toChecksumAddress('0x1bacc2205312534375c8d1801c27d28370656cff')
+
+    # OP -> apto 的合约地址
+    OP_TO_APTO_CONTRACT_ADDRESS = Web3.toChecksumAddress('0x86bb63148d17d445ed5398ef26aa05bf76dd5b59')
+
+    # arb 跨 op 的 路由地址,用户获取gas cost
+    ROUTER_ARB_OP = Web3.toChecksumAddress("0x53bf833a5d6c4dda888f69c22c88c9f356a41614")
+    # op 跨 arb 的 路由地址,用户获取gas cost
+    ROUTER_OP_TO_ARB = Web3.toChecksumAddress("0xb0d502e938ed5f4df2e681fe6e419ff29631d62b")
+
+    # arb loop Eth 的token
+    TOKEN_LP_ETH = Web3.toChecksumAddress('0x915a55e36a01285a14f05de6e81ed9ce89772f8e')
+
+    # arb loop deposit的合约
+    ARB_POOL_DEPOSIT_CONTRACT_ADDRESS = Web3.toChecksumAddress('0xea8dfee1898a7e0a59f7527f076106d7e44c2176')
+
+    def __init__(self, web3: Web3, type=StargateType.TYPE_ARB_TO_OP, isCheckGasCost=False):
+        self.isCheckGasCost = isCheckGasCost
+        self.type = type
+        self.web3 = web3
+        if StargateType.TYPE_ARB_TO_OP == type:
+            self.contract_address = Web3.toChecksumAddress(StargateClient.STARGATE_ARB_TO_OP_CONTRACT_ADDRESS)
+            self.contract = self.web3.eth.contract(address=self.contract_address, abi=StargateClient.STARGATE_ABI)
+        elif StargateType.TYPE_OP_TO_ARB == type:
+            self.contract_address = Web3.toChecksumAddress(StargateClient.STARGATE_OP_TO_ARB_CONTRACT_ADDRESS)
+            self.contract = self.web3.eth.contract(address=self.contract_address, abi=StargateClient.STARGATE_ABI)
+
+        elif type == StargateType.TYPE_REMOVE_POOL:
+            self.contract_address = Web3.toChecksumAddress(StargateClient.STARGATE_REMOVE_POOL_CONTRACT_ADDRESS)
+            self.contract = self.web3.eth.contract(address=self.contract_address,
+                                                   abi=StargateClient.STARGATE_REMOVE_POOL_ABI)
+        elif type == StargateType.TYPE_ARB_TO_APT:
+            self.contract_address = Web3.toChecksumAddress(StargateClient.ARB_TO_APT_CONTRACT_ADDRESS)
+            self.contract = self.web3.eth.contract(address=self.contract_address,
+                                                   abi=StargateClient.ARB_TO_APT_ABI)
+
+        elif type == StargateType.TYPE_OP_TO_APT:
+            self.contract_address = Web3.toChecksumAddress(StargateClient.OP_TO_APTO_CONTRACT_ADDRESS)
+            self.contract = self.web3.eth.contract(address=self.contract_address,
+                                                   abi=StargateClient.ARB_TO_APT_ABI)
+
+        elif type == StargateType.TYPE_ARB_POOL_DEPOSIT:
+            self.contract_address = Web3.toChecksumAddress(StargateClient.ARB_POOL_DEPOSIT_CONTRACT_ADDRESS)
+            self.contract = self.web3.eth.contract(address=self.contract_address,
+                                                   abi=StargateClient.ARB_POOL_DEPOSIT_ABI)
+
+        elif type == StargateType.TYPE_SUSHI_ARB_TO_OP:
+            self.contract_address = Web3.toChecksumAddress(StargateClient.SUSHI_ARB_TO_OP_CONTRACT_ADDRESS)
+            self.contract = self.web3.eth.contract(address=self.contract_address,
+                                                   abi=StargateClient.SUSHISWAP_ABI)
+
+        self.chain_id = self.web3.eth.chainId
+
+    def getStargArbToOpGasCost(self):
+        '''
+        arb - op 跨链 手续费
+        :return:
+        '''
+        data = '0x0a512369000000000000000000000000000000000000000000000000000000000000006f000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000000000e0000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000140000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000140000000000000000000000000000000000000001000000000000000000000000'
+        param = {
+            "to": StargateClient.ROUTER_ARB_OP,
+            "data": data
+        }
+
+        if self.isCheckGasCost:
+            # 循环检查gasCost
+            while True:
+                result = self.web3.eth.call(param).hex()
+                gasCost = int(result[2:66], 16)
+                if gasCost / pow(10, 18) < 0.0007:
+                    break
+
+                print(f"gasCost费用过高，不处理[{gasCost / pow(10, 18)}]")
+                time.sleep(60)
+        else:
+            result = self.web3.eth.call(param).hex()
+            gasCost = int(result[2:66], 16)
+
+        return gasCost
+
+    def getStargOpToArbGasCost(self):
+        '''
+        op - arb 跨链 手续费
+        :return:
+        '''
+        data = '0x0a512369000000000000000000000000000000000000000000000000000000000000006e000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000000000e0000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000140000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000140000000000000000000000000000000000000001000000000000000000000000'
+        param = {
+            "to": StargateClient.ROUTER_OP_TO_ARB,
+            "data": data
+        }
+
+        if self.isCheckGasCost:
+            # 循环检查gasCost
+            while True:
+                result = self.web3.eth.call(param).hex()
+                gasCost = int(result[2:66], 16)
+                if gasCost / pow(10, 18) < 0.0007:
+                    break
+                print(f"gasCost费用过高，不处理[{gasCost / pow(10, 18)}]")
+                time.sleep(60)
+        else:
+            result = self.web3.eth.call(param).hex()
+            gasCost = int(result[2:66], 16)
+
+        return gasCost
+
+    def getArbToAptoGasCost(self, dstNativeAmount, aptoAddress):
+        '''
+        arb - apto 跨链手续费
+        :return:
+        '''
+        data = f'0x468b966800000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000620002000000000000000000000000000000000000000000000000000000000000271000000000000000000000000000000000000000000000000000000000000{hex(dstNativeAmount).replace("0x", "")}{aptoAddress.replace("0x", "")}000000000000000000000000000000000000000000000000000000000000'
+
+        to = StargateClient.ARB_TO_APT_CONTRACT_ADDRESS
+        if self.type == StargateType.TYPE_OP_TO_APT:
+            to = StargateClient.OP_TO_APTO_CONTRACT_ADDRESS
+        param = {
+            "to": to,
+            "data": data
+        }
+
+        if self.isCheckGasCost:
+            # 循环检查gasCost
+            while True:
+                result = self.web3.eth.call(param).hex()
+                gasCost = int(result[2:66], 16)
+                if gasCost / pow(10, 18) < 0.0007:
+                    break
+                print(f"gasCost费用过高，不处理[{gasCost / pow(10, 18)}]")
+                time.sleep(60)
+        else:
+            result = self.web3.eth.call(param).hex()
+            gasCost = int(result[2:66], 16)
+        # 加上滑点
+        gasCost = gasCost + + 10000000000
+        return gasCost
+
+    def getSuShiArbToOpGasCost(self):
+        '''
+        sushiSwap 上 arb -> op的 手续费
+        :return:
+        '''
+        data = '0x6ce4fe03000000000000000000000000000000000000000000000000000000000000006f00000000000000000000000000000000000000000000000000000000000000010000000000000000000000008b396ddf906d552b2f98a8e7d743dd58cd0d920f0000000000000000000000000000000000000000000000000000000000102ca0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000003c0000000000000000000000000c75f686136f7bab19d77120fa90373a2d241fb14000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000e0000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000001a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000007f5c764cbc14f9669b88837ca1490cca17c31607000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000265ca000c9d2b80000000000000000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000200000000000000000000000007086622e6db990385b102d79cb1218947fb549a9000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000600000000000000000000000007f5c764cbc14f9669b88837ca1490c'
+        param = {
+            "to": StargateClient.SUSHI_ARB_TO_OP_CONTRACT_ADDRESS,
+            "data": data
+        }
+
+        if self.isCheckGasCost:
+            # 循环检查gasCost
+            while True:
+                result = self.web3.eth.call(param).hex()
+                gasCost = int(result[2:66], 16)
+                if gasCost / pow(10, 18) < 0.0007:
+                    break
+                print(f"gasCost费用过高，不处理[{gasCost / pow(10, 18)}]")
+        else:
+            result = self.web3.eth.call(param).hex()
+            gasCost = int(result[2:66], 16)
+
+        return gasCost
+
+    def stargArb2op(self, address, private_key, amount, gas_limit):
+        '''
+        arb -> op跨链
+        :param fromAddress:
+        :param dstChainId:
+        :param amount:
+        :param gas_price:
+        :param gas_limit:
+        :return:
+        '''
+        fromAddress = Web3.toChecksumAddress(address)
+        amountLD = int(amount * pow(10, 18))
+        minAmountLD = int(amountLD * 0.995)
+        value = amountLD + self.getStargArbToOpGasCost()
+        dstChainId = StargateClient.CURRENCY['ETH-ARB-TO-OP']['chainId']
+
+        gas_price = getGasPrice(self.web3, 50)
+        txn = {
+            'chainId': self.chain_id,
+            'gasPrice': eth_utils.to_wei(gas_price, "gwei"),
+            'nonce': self.web3.eth.getTransactionCount(fromAddress),
+            'from': fromAddress,
+            'value': value
+        }
+        transfer_txn = self.contract.functions.swapETH(dstChainId, fromAddress, fromAddress, amountLD,
+                                                       minAmountLD).buildTransaction(txn)
+
+        signed_tran = self.web3.eth.account.sign_transaction(transfer_txn, private_key=private_key)
+        tran_hash = self.web3.eth.sendRawTransaction(signed_tran.rawTransaction)
+        return TransactionRet(tran_hash=tran_hash, web3=self.web3)
+
+    def stargOP2Arb(self, address, private_key, amount, gas_limit):
+        '''
+        op -> arb跨链
+        :param fromAddress:
+        :param dstChainId:
+        :param amount:
+        :param gas_price:
+        :param gas_limit:
+        :return:
+        '''
+        fromAddress = Web3.toChecksumAddress(address)
+        amountLD = int(amount * pow(10, 18))
+        minAmountLD = int(amountLD * 0.995)
+        value = amountLD + self.getStargOpToArbGasCost()
+        dstChainId = StargateClient.CURRENCY['ETH-OP-TO-ARB']['chainId']
+
+        gas_price = getGasPrice(self.web3, 50)
+        txn = {
+            'chainId': self.chain_id,
+            'gasPrice': eth_utils.to_wei(gas_price, "gwei"),
+            'nonce': self.web3.eth.getTransactionCount(fromAddress),
+            'from': fromAddress,
+            'value': value
+        }
+        transfer_txn = self.contract.functions.swapETH(dstChainId, fromAddress, fromAddress, amountLD,
+                                                       minAmountLD).buildTransaction(txn)
+        signed_tran = self.web3.eth.account.sign_transaction(transfer_txn, private_key=private_key)
+        tran_hash = self.web3.eth.sendRawTransaction(signed_tran.rawTransaction)
+        return TransactionRet(tran_hash=tran_hash, web3=self.web3)
+
+    def addETHPool(self, address, private_key, amount, gas_limit):
+        '''
+        添加ETH流动性
+        :param fromAddress:
+        :param private_key:
+        :param amount:
+        :param gas_limit:
+        :return:
+        '''
+        fromAddress = Web3.toChecksumAddress(address)
+        gas_price = getGasPrice(self.web3, 50)
+        txn = {
+            'chainId': self.chain_id,
+            'gasPrice': eth_utils.to_wei(gas_price, "gwei"),
+            'nonce': self.web3.eth.getTransactionCount(fromAddress),
+            'from': fromAddress,
+            'value': int(amount * pow(10, 18))
+        }
+        transfer_txn = self.contract.functions.addLiquidityETH().buildTransaction(txn)
+        signed_tran = self.web3.eth.account.sign_transaction(transfer_txn, private_key=private_key)
+        tran_hash = self.web3.eth.sendRawTransaction(signed_tran.rawTransaction)
+        return TransactionRet(tran_hash=tran_hash, web3=self.web3)
+
+    def ethPoolDeposit(self, address, private_key, amount):
+        '''
+        添加ETH流动性
+        :param fromAddress:
+        :param private_key:
+        :param amount:
+        :param gas_limit:
+        :return:
+        '''
+        fromAddress = Web3.toChecksumAddress(address)
+        gas_price = getGasPrice(self.web3, 50)
+        txn = {
+            'chainId': self.chain_id,
+            'gasPrice': eth_utils.to_wei(gas_price, "gwei"),
+            'nonce': self.web3.eth.getTransactionCount(fromAddress),
+            'from': fromAddress
+        }
+        transfer_txn = self.contract.functions.deposit(2, amount).buildTransaction(txn)
+        signed_tran = self.web3.eth.account.sign_transaction(transfer_txn, private_key=private_key)
+        tran_hash = self.web3.eth.sendRawTransaction(signed_tran.rawTransaction)
+        return TransactionRet(tran_hash=tran_hash, web3=self.web3)
+
+    def removeAllETHPool(self, address, private_key, gas_limit):
+        '''
+        全部移除ETH池子
+        :param fromAddress:
+        :param private_key:
+        :param gas_limit:
+        :return:
+        '''
+        fromAddress = Web3.toChecksumAddress(address)
+
+        # 获取lp 池里ETH 的余额
+        erc20Token = ERC20Token(StargateClient.TOKEN_LP_ETH, self.web3)
+        daibiBalance = erc20Token.balanceOf(Web3.toChecksumAddress(fromAddress))
+        if daibiBalance == 0:
+            print("{} 暂无pool数据,无需移除".format(address))
+            return None
+
+        gas_price = getGasPrice(self.web3, 50)
+        txn = {
+            'chainId': self.chain_id,
+            'gasPrice': eth_utils.to_wei(gas_price, "gwei"),
+            'nonce': self.web3.eth.getTransactionCount(fromAddress),
+            'from': fromAddress,
+            'value': 0
+        }
+        transfer_txn = self.contract.functions.instantRedeemLocal(13, daibiBalance,
+                                                                  fromAddress).buildTransaction(txn)
+        signed_tran = self.web3.eth.account.sign_transaction(transfer_txn, private_key=private_key)
+        tran_hash = self.web3.eth.sendRawTransaction(signed_tran.rawTransaction)
+        return TransactionRet(tran_hash=tran_hash, web3=self.web3)
+
+    def sendETHToAptos(self, address, private_key, toAddress, amount, gas_limit):
+        '''
+        Arb 或 OP 跨到apto
+        :param address:
+        :param private_key:
+        :param toAddress:
+        :param amount:
+        :param gas_limit:
+        :return:
+        '''
+        fromAddress = Web3.toChecksumAddress(address)
+
+        amountLD = int(amount * pow(10, 18))
+
+        dstNativeAmount = 520400
+        aptoAddress = str(toAddress).replace('0x', '').lower()
+
+        value = amountLD + self.getArbToAptoGasCost(dstNativeAmount, aptoAddress)
+        zroPaymentAddress = Web3.toChecksumAddress("0x0000000000000000000000000000000000000000")
+        callAdapter = f"0x0002000000000000000000000000000000000000000000000000000000000000271000000000000000000000000000000000000000000000000000000000000{hex(dstNativeAmount).replace('0x', '')}{aptoAddress}"
+
+        gas_price = getGasPrice(self.web3, 50)
+        txn = {
+            'chainId': self.chain_id,
+            'gasPrice': eth_utils.to_wei(gas_price, "gwei"),
+            'nonce': self.web3.eth.getTransactionCount(fromAddress),
+            'from': fromAddress,
+            'value': value
+        }
+        transfer_txn = self.contract.functions.sendETHToAptos(toAddress,
+                                                              amountLD,
+                                                              (fromAddress, zroPaymentAddress),
+                                                              callAdapter
+                                                              ).buildTransaction(txn)
+
+        signed_tran = self.web3.eth.account.sign_transaction(transfer_txn, private_key=private_key)
+
+        tran_hash = self.web3.eth.sendRawTransaction(signed_tran.rawTransaction)
+        return TransactionRet(tran_hash=tran_hash, web3=self.web3)
+
+    def suShiArbToOp(self, address, private_key, toAddress, amount):
+        '''
+        SushiSwap平台 Arb -> op  (未完成)
+        :param address:
+        :param private_key:
+        :param toAddress:
+        :param amount:
+        :return:
+        '''
+        fromAddress = Web3.toChecksumAddress(address)
+        amountLD = int(amount * pow(10, 18))
+        value = amountLD + self.getSuShiArbToOpGasCost()
+
+        fromAddressStr = str(fromAddress).lower().replace('0x', '')
+
+        action = [0, 1, 2, 7, 10]
+        values = [0, amountLD, 0, 0, 0]
+
+        datas = [
+            '0x000000000000000000000000{}0000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000001bb95f24ed9c1a962b8b85ece389111d142dd15ff36c16467f008dd15c9ebff97d47f3213f0048f9107c6bcecc100e51af3603ccc4889b2b09efe12470a5544b64'.format(
+                fromAddress.replace('0x', '')),
+
+            '0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000{}00000000000000000000000000000000000000000000000000{}0000000000000000000000000000000000000000000000000000000000000000'.format(
+                fromAddressStr, hex(amountLD).replace('0x', '')),
+
+            '0x00000000000000000000000082af49447d8a07e3bd95bd0d56f35241523fbab100000000000000000000000053b08dbd70327b7ba3b7886fc9987bc985d2726200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000018282797b3fbba0000000000000000000000000000000000000000000000000000000000000001'.format(
+                fromAddressStr),
+
+            '0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000b4599a000000000000000000000000000000000000000000000000000000000000008000000000000000000000000053b08dbd70327b7ba3b7886fc9987bc985d27262000000000000000000000000000000000000000000000000000000000000000200000000000000000000000082af49447d8a07e3bd95bd0d56f35241523fbab1000000000000000000000000ff970a61a04b1ca14834a43f5de4533ebddb5cc8',
+            '0x000000000000000000000000000000000000000000000000000000000000006f000000000000000000000000ff970a61a04b1ca14834a43f5de4533ebddb5cc8000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008b396ddf906d552b2f98a8e7d743dd58cd0d920f000000000000000000000000{}7726aaa7485c70c0a51e37ad903a0dd9422d20000000000000000000000000000000000000000000000000000000000102ca04e56747a4852445673574a4f4734667a4d37374933000000000000000000000000000000000000000000000000000000000000000000000000000000000001c00000000000000000000000000000000000000000000000000000000000000220000000000000000000000000000000000000000000000000000000000000028000000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000001a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000007f5c764cbc14f9669b88837ca1490cca17c3160700000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000017ad6d6c8a1f8d0000000000000000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000200000000000000000000000007086622e6db990385b102d79cb1218947fb549a9000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000600000000000000000000000007f5c764cbc14f9669b88837ca1490cca17c316070000000000000000000000008b396ddf906d552b2f98a8e7d743dd58cd0d920f000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000400000000000000000000000004200000000000000000000000000000000000006000000000000000000000000{}'.format(
+                fromAddressStr),
+
+        ]
+
+        gas_price = getGasPrice(self.web3, 50)
+        txn = {
+            'chainId': self.chain_id,
+            'gasPrice': eth_utils.to_wei(gas_price, "gwei"),
+            'nonce': self.web3.eth.getTransactionCount(fromAddress),
+            'from': fromAddress,
+            'value': value
+        }
+        # transfer_txn = self.contract.functions.cook(toAddress,
+        #                                             amountLD,
+        #                                             (fromAddress, zroPaymentAddress),
+        #                                             callAdapter
+        #                                             ).buildTransaction(txn)
+
+
+def getTimeMillisecond():
+    '''
+    毫秒数
+    :return:
+    '''
+    return int(round(time.time() * 1000))
+
+
+def getTimeFormat(timeMillisecond=None):
+    '''
+    时间格式化
+    :return:
+    '''
+    if timeMillisecond is None:
+        timeStamp = getTimeMillisecond() / 1000
+    else:
+        timeStamp = timeMillisecond / 1000
+    timeArray = time.localtime(timeStamp)
+
+    otherStyleTime = time.strftime("%Y-%m-%d %H:%M:%S", timeArray)
+
+    return otherStyleTime
+
+
+def timeFormatToTimeMillisecond(timeFormat):
+    s_t = time.strptime(timeFormat, "%Y-%m-%d %H:%M:%S")
+    mkt = int(time.mktime(s_t)) * 1000
+    return mkt
+
+
+def arbToOp(address, privateKey, amount):
+    '''
+    arb 跨链到 op
+    :param address:
+    :param privateKey:
+    :param amount:
+    :return:
+    '''
+    if selectArbBalance(address) / pow(10, 18) < amount:
+        return {'status': 0, 'transactionHash': '余额不足，跳过'}
+
+    web3 = Web3(Web3.HTTPProvider(ChainInfo.arb['rpc']))
+    client = StargateClient(web3, StargateType.TYPE_ARB_TO_OP, False)
+    res = client.stargArb2op(address, privateKey, amount, ChainInfo.arb['gas_limit'])
+    x = res.wait()
+    print(address, x['status'], x['transactionHash'].hex())
+
+    return {'status': x['status'], 'transactionHash': x['transactionHash'].hex()}
+
+
+def opToArb(address, privateKey, amount):
+    '''
+    op 跨链到 arb
+    :param address:
+    :param privateKey:
+    :param amount:
+    :return:
+    '''
+    if selectOpBalance(address) / pow(10, 18) < amount:
+        return {'status': 0, 'transactionHash': '余额不足，跳过'}
+
+    web3 = Web3(Web3.HTTPProvider(ChainInfo.op['rpc']))
+    client = StargateClient(web3, StargateType.TYPE_OP_TO_ARB, False)
+    res = client.stargOP2Arb(address, privateKey, amount, ChainInfo.op['gas_limit'])
+    x = res.wait()
+    print(address, x['status'], x['transactionHash'].hex())
+
+    return {'status': x['status'], 'transactionHash': x['transactionHash'].hex()}
+
+
+def addArbPoolEth(address, privateKey, amount, needStake=True):
+    '''
+    arb 连添加ETH 到  pool
+    :param address:
+    :param privateKey:
+    :param amount:
+    :return:
+    '''
+    if selectLpEthBalance(address) > 0:
+        return {'status': 0, 'transactionHash': "已经添加过流动性，不再添加"}
+
+    # try:
+    #     isStakeFarming = debank_util.isStakeFarm(address)
+    #     if isStakeFarming:
+    #         return {'status': 0, 'transactionHash': "已经添加过流动性，不在添加"}
+    # except Exception as e:
+    #     logging.warning(e)
+    #     return {'status': 0, 'transactionHash': "查询质押信息出错，暂不处理"}
+
+    address = Web3.toChecksumAddress(address)
+    web3 = Web3(Web3.HTTPProvider(ChainInfo.arb['rpc']))
+    client = StargateClient(web3, StargateType.TYPE_ARB_TO_OP)
+
+    res = client.addETHPool(address, privateKey, amount, ChainInfo.arb['gas_limit'])
+    x = res.wait()
+    logging.info(f"{address}, {x['status']}, {x['transactionHash'].hex()}")
+    if not needStake:
+        return {'status': x['status'], 'transactionHash': x['transactionHash'].hex()}
+
+    time.sleep(random.randint(10, 60))
+
+    allowanceAmount = ERC20Token(StargateClient.TOKEN_LP_ETH, web3).allowance(address,
+                                                                              StargateClient.ARB_POOL_DEPOSIT_CONTRACT_ADDRESS)
+    if allowanceAmount <= 0:
+        res2 = ERC20Token(StargateClient.TOKEN_LP_ETH, web3).approve(address, privateKey,
+                                                                     StargateClient.ARB_POOL_DEPOSIT_CONTRACT_ADDRESS,
+                                                                     int(0.1 * pow(10, 18)),
+                                                                     ChainInfo.arb['gas_price'])
+        x2 = res2.wait()
+        logging.info(f"{address}, {x2['status']}, {x2['transactionHash'].hex()}")
+        time.sleep(random.randint(10, 60))
+
+    sgEthAmount = ERC20Token(StargateClient.TOKEN_LP_ETH, web3).balanceOf(address)
+
+    res3 = StargateClient(web3, StargateType.TYPE_ARB_POOL_DEPOSIT).ethPoolDeposit(address, privateKey, sgEthAmount)
+    x3 = res3.wait()
+    logging.info(f"{address}, {x3['status']}, {x3['transactionHash'].hex()}")
+    return {'status': x3['status'], 'transactionHash': x3['transactionHash'].hex()}
+
+
+def removeArbPoolEth(address, privateKey):
+    '''
+    abr 移除pool里的全部ETH
+    :param address:
+    :param privateKey:
+    :return:
+    '''
+
+    web3 = Web3(Web3.HTTPProvider(ChainInfo.arb['rpc']))
+    client = StargateClient(web3, StargateType.TYPE_REMOVE_POOL)  # 只有移除是另一个abi
+    res = client.removeAllETHPool(address, privateKey, ChainInfo.arb['gas_limit'])
+    x = res.wait()
+    print(address, x['status'], x['transactionHash'].hex())
+
+    return {'status': x['status'], 'transactionHash': x['transactionHash'].hex()}
+
+
+def arbToApto(address, priviteKey, toAddress, amount):
+    '''
+    arb 跨到 apto
+    :param address:
+    :param priviteKey:
+    :param toAddress:
+    :param amount:
+    :return:
+    '''
+    if selectArbBalance(address) / pow(10, 18) < amount:
+        return {'status': 0, 'transactionHash': '余额不足，跳过'}
+
+    arbWeb3 = Web3(Web3.HTTPProvider(ChainInfo.arb['rpc']))
+    client = StargateClient(arbWeb3, StargateType.TYPE_ARB_TO_APT, False)
+    res = client.sendETHToAptos(address,
+                                priviteKey,
+                                toAddress,
+                                amount,
+                                ChainInfo.arb['gas_limit'])
+    x = res.wait()
+    print(address, x['status'], x['transactionHash'].hex())
+    return {'status': x['status'], 'transactionHash': x['transactionHash'].hex()}
+
+
+def opToApto(address, priviteKey, toAddress, amount):
+    '''
+    op 跨到 apto
+    :param address:
+    :param priviteKey:
+    :param toAddress:
+    :param amount:
+    :return:
+    '''
+    if selectOpBalance(address) / pow(10, 18) < amount:
+        return {'status': 0, 'transactionHash': '余额不足，跳过'}
+
+    opWeb3 = Web3(Web3.HTTPProvider(ChainInfo.op['rpc']))
+    client = StargateClient(opWeb3, StargateType.TYPE_OP_TO_APT, False)
+    res = client.sendETHToAptos(address,
+                                priviteKey,
+                                toAddress,
+                                amount,
+                                ChainInfo.arb['gas_limit'])
+    x = res.wait()
+    print(address, x['status'], x['transactionHash'].hex())
+    return {'status': x['status'], 'transactionHash': x['transactionHash'].hex()}
+
+
+def selectArbBalance(wallet):
+    '''
+    查询arb 的余额
+    :param wallet:
+    :return:
+    '''
+    arbWeb3 = Web3(Web3.HTTPProvider(ChainInfo.arb['rpc']))
+    arbBalance = arbWeb3.eth.get_balance(Web3.toChecksumAddress(wallet))
+    return arbBalance
+
+
+def selectOpBalance(wallet):
+    '''
+    查询op余额
+    :param wallet:
+    :return:
+    '''
+    opWeb3 = Web3(Web3.HTTPProvider(ChainInfo.op['rpc']))
+    opBalance = opWeb3.eth.get_balance(Web3.toChecksumAddress(wallet))
+    return opBalance
+
+
+def selectLpEthBalance(wallet):
+    '''
+    查询LP 中eth 的余额
+    :param wallet:
+    :return:
+    '''
+    arbWeb3 = Web3(Web3.HTTPProvider(ChainInfo.arb['rpc']))
+    erc20Token = ERC20Token(StargateClient.TOKEN_LP_ETH, arbWeb3)
+    daibiBalance = erc20Token.balanceOf(Web3.toChecksumAddress(wallet))
+    return daibiBalance
+
+
+def printAllBalance(wallet):
+    '''
+    打印钱包所有余额
+    :param wallet:
+    :return:
+    '''
+    opBalance = selectOpBalance(wallet) / pow(10, 18)
+    arbBalance = selectArbBalance(wallet) / pow(10, 18)
+    daibiBalance = selectLpEthBalance(wallet) / pow(10, 18)
+
+    logging.info("{}---->op: {} ------> arb: {} ------> LP: {}".format(wallet, opBalance, arbBalance, daibiBalance))
+
+# if __name__ == '__main__':
+# arbWeb3 = Web3(Web3.HTTPProvider(ChainInfo.op['rpc']))
+# client = StargateClient(arbWeb3, StargateType.TYPE_ARB_TO_APT, False)
+# gasCost = client.getArbToAptoGasCost(520400, '0x440a68ec00a2c9c38477799ddc1bfa71e7d1e8a8b100f778efc3f14d23c0e9ec')
+# # print(gasCost / pow(10, 18))
+#
+# client.sendETHToAptos('','','0xeb69357b6a0e1fc1e0eb869f95ded1fdb7c0ce13eb04b2037258737ee9e7b339',0.001,ChainInfo.arb['rpc'])
+#     while True:
+#         try:
+#             print(client.getArbToAptoGasCost() / pow(10, 18))
+#         except:
+#             pass
+#         time.sleep(5 * 60)
